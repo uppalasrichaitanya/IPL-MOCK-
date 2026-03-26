@@ -37,6 +37,15 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// ── Base Route ─────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.status(200).json({ 
+    message: 'Welcome to IPL Fantasy Betting API 🏏',
+    status: 'online',
+    docs: '/api/docs' // Optional pointer for API documentation if applicable
+  });
+});
+
 // ── Health check (UptimeRobot pings this) ────────────────
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'alive', timestamp: new Date().toISOString() });
