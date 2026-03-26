@@ -23,17 +23,27 @@ const { startSocketService } = require('./services/socketService');
 const app = express();
 const server = http.createServer(app);
 
+const clientUrl = process.env.CLIENT_URL ? process.env.CLIENT_URL.replace(/\/$/, '') : 'http://localhost:5173';
+const allowedOrigins = [
+  clientUrl,
+  `${clientUrl}/`,
+  'https://ipl-mock.vercel.app',
+  'http://localhost:5173'
+];
+
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
+    origin: allowedOrigins,
     methods: ['GET', 'POST'],
+    credentials: true
   },
 });
 
 // ── Middleware ────────────────────────────────────────────
 app.use(helmet());
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:5173',
+  origin: allowedOrigins,
+  credentials: true
 }));
 app.use(express.json());
 
