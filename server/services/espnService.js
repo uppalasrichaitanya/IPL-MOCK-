@@ -25,7 +25,11 @@ let pollInterval = null;
 //   matchId, status, venue, teams[], innings[],
 //   currentBatsmen[], currentBowler, lastSixBalls[],
 //   crr, rrr, target, runsNeeded, ballsRemaining,
-//   overs, wickets, score, isLive, lastUpdated
+//   overs, wickets, score, isLive, lastUpdated,
+//   extrasData: { widesThisInnings, noBallsThisInnings,
+//     byesThisInnings, legByesThisInnings, totalExtras,
+//     extrasThisOver, lastBallWasNoBall, lastBallWasWide,
+//     freehitActive, extrasRate }
 // }
 
 /**
@@ -81,6 +85,51 @@ function parseESPNMatch(event) {
       wickets: bowler.wickets || '0',
     } : null;
 
+    // ── Extract extras data ──────────────────────────────
+    // ESPN may provide extras in the innings object or situation
+    const innings       = situation.currentInningsData || situation.innings || {};
+    const currentOver   = situation.currentOverData    || situation.currentOverObj || {};
+    const lastDelivery  = situation.lastDelivery       || situation.lastBall       || {};
+
+    const widesThisInnings   = parseInt(innings.wides    || innings.Wides    || 0);
+    const noBallsThisInnings = parseInt(innings.noballs  || innings.Noballs  || innings.noBalls || 0);
+    const byesThisInnings    = parseInt(innings.byes     || innings.Byes     || 0);
+    const legByesThisInnings = parseInt(innings.legbyes  || innings.Legbyes  || innings.legByes || 0);
+    const totalExtras        = parseInt(
+      innings.extras || innings.Extras ||
+      (widesThisInnings + noBallsThisInnings + byesThisInnings + legByesThisInnings) ||
+      0
+    );
+
+    const extrasThisOver = parseInt(
+      currentOver.extras || currentOver.extraRuns || 0
+    );
+
+    // Last delivery type detection
+    const lastDeliveryType   = (lastDelivery.type || lastDelivery.deliveryType || '').toLowerCase();
+    const lastBallWasNoBall  = lastDeliveryType === 'noball' || lastDeliveryType === 'no ball' || false;
+    const lastBallWasWide    = lastDeliveryType === 'wide'   || false;
+    // Free hit = next ball if last delivery was a no ball
+    const freehitActive      = lastBallWasNoBall;
+
+    const currentOverNum = parseFloat(situation.currentOver || 1);
+    const extrasRate     = parseFloat(
+      (totalExtras / Math.max(currentOverNum, 1)).toFixed(2)
+    );
+
+    const extrasData = {
+      widesThisInnings,
+      noBallsThisInnings,
+      byesThisInnings,
+      legByesThisInnings,
+      totalExtras,
+      extrasThisOver,
+      lastBallWasNoBall,
+      lastBallWasWide,
+      freehitActive,
+      extrasRate,
+    };
+
     const matchState = {
       matchId: event.id,
       status: event.status?.type?.description || 'Unknown',
@@ -118,6 +167,9 @@ function parseESPNMatch(event) {
       // Recent overs (for momentum calc)
       recentOvers: (situation.recentOvers || []).slice(0, 3),
 
+      // Extras tracking (NEW)
+      extrasData,
+
       lastUpdated: new Date().toISOString(),
     };
 
@@ -149,12 +201,17 @@ async function fetchScoreboard() {
     return lastGoodData || { matches: [], timestamp: new Date().toISOString(), source: 'espn' };
   } catch (err) {
     consecutiveFailures++;
+    if (consecutiveFailures > MAX_FAILURES_BEFORE_FALLBACK) {
+      consecutiveFailures = MAX_FAILURES_BEFORE_FALLBACK;
+    }
     console.error(`⚠️  ESPN fetch failed (${consecutiveFailures}/${MAX_FAILURES_BEFORE_FALLBACK}):`, err.message);
 
     // Trigger fallback after 3 consecutive failures
     if (consecutiveFailures >= MAX_FAILURES_BEFORE_FALLBACK) {
       console.log('🔄 Switching to Cricbuzz fallback...');
       usingFallback = true;
+      consecutiveFailures = 0; // Reset counter to 0 after switching
+
       try {
         const fallbackData = await getCricbuzzFallback();
         if (fallbackData && fallbackData.matches?.length > 0) {
@@ -188,6 +245,9 @@ async function fetchMatchDetail(matchId) {
     return parseESPNMatch(response.data);
   } catch (err) {
     consecutiveFailures++;
+    if (consecutiveFailures > MAX_FAILURES_BEFORE_FALLBACK) {
+      consecutiveFailures = MAX_FAILURES_BEFORE_FALLBACK;
+    }
     console.error(`⚠️  ESPN match detail fetch failed for ${matchId}:`, err.message);
     return null;
   }

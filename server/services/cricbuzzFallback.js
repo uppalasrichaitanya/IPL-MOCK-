@@ -84,6 +84,12 @@ function parseCricbuzzData(data) {
             const team1Score = score?.team1Score?.inngs1 || {};
             const team2Score = score?.team2Score?.inngs1 || {};
 
+            // Extract total extras from Cricbuzz scorecard if available
+            const cbExtrasTotal = parseInt(
+              team1Score.extras || team1Score.Extras || 0
+            );
+            const cbOvers = parseFloat(team1Score.overs || 1);
+
             parsedMatches.push({
               matchId: `cb_${info.matchId || Date.now()}`,
               status: info.status || 'Unknown',
@@ -130,6 +136,24 @@ function parseCricbuzzData(data) {
               isPowerplay: false,
               partnership: { runs: 0, balls: 0 },
               recentOvers: [],
+
+              // Extras: Cricbuzz may have total extras but not breakdown
+              // Gracefully default all breakdown fields to 0
+              extrasData: {
+                widesThisInnings:   0,
+                noBallsThisInnings: 0,
+                byesThisInnings:    0,
+                legByesThisInnings: 0,
+                totalExtras:        cbExtrasTotal,
+                extrasThisOver:     0,
+                lastBallWasNoBall:  false,
+                lastBallWasWide:    false,
+                freehitActive:      false,
+                extrasRate: parseFloat(
+                  (cbExtrasTotal / Math.max(cbOvers, 1)).toFixed(2)
+                ),
+              },
+
               lastUpdated: new Date().toISOString(),
             });
           });

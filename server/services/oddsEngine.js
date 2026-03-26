@@ -2,17 +2,25 @@
 // services/oddsEngine.js — Core Odds Calculation Engine
 // Runs every 15 seconds. Calculates win probability using:
 //   1. Team strength ratings (base)
-//   2. Run rate factor
-//   3. Wickets factor
+//   2. Run rate factor (sigmoid)
+//   3. Wickets factor (death-aware)
 //   4. Overs remaining volatility
 //   5. Momentum factor (last 3 overs)
 //   6. Powerplay factor
+//   7. Extras factor
+//   8. ML probability engine (Render) — hybrid blend
 //
 // House margin: 5% (configurable via .env)
 // Probability clamped: 5% – 95%
 // ═══════════════════════════════════════════════════════════
 
-const HOUSE_MARGIN = parseFloat(process.env.HOUSE_MARGIN || 0.05);
+const axios = require('axios');
+
+const HOUSE_MARGIN  = parseFloat(process.env.HOUSE_MARGIN  || 0.05);
+const ML_API_URL    = process.env.ML_API_URL;
+const ML_WEIGHT     = parseFloat(process.env.ML_WEIGHT     || '0.6');
+const RULE_WEIGHT   = parseFloat(process.env.RULE_WEIGHT   || '0.4');
+const ML_TIMEOUT    = parseInt(process.env.ML_TIMEOUT_MS   || '3000');
 
 // ── IPL 2026 Team Strength Ratings ───────────────────────
 const TEAM_RATINGS = {
@@ -43,6 +51,124 @@ const STAR_BATSMEN = {
 };
 
 // ═══════════════════════════════════════════════════════════
+// HELPER FUNCTIONS: Sigmoid + Factor Functions
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Sigmoid function — maps any real number to (0, 1)
+ */
+function sigmoid(x) {
+  return 1 / (1 + Math.exp(-x));
+}
+
+/**
+ * Run rate factor using sigmoid scaling.
+ * Max adjustment ±12.5% (was linear ±3.5% per run delta)
+ */
+function runRateFactor(CRR, RRR) {
+  const delta = CRR - RRR;
+  // Sigmoid centered at 0; scale 0.3 controls steepness
+  const adjustment = (sigmoid(delta * 0.3) - 0.5) * 0.25;
+  return adjustment;
+}
+
+/**
+ * Wickets factor — death-over aware.
+ * Wickets hurt more when fewer overs remain.
+ */
+function wicketsFactor(wicketsFallen, starBatsmanOut, oversRemaining) {
+  const deathMultiplier = oversRemaining < 5 ? 1.5 : 1.0;
+  let adjustment = wicketsFallen * 0.045 * deathMultiplier;
+  if (starBatsmanOut) {
+    adjustment += 0.06 * deathMultiplier;
+  }
+  return -adjustment;
+}
+
+/**
+ * Extras factor — 6 sub-factors reflecting bowling indiscipline.
+ * Returns 0–0.15 (always benefits batting team).
+ */
+function extrasFactor(matchState) {
+  const {
+    extrasData     = {},
+    currentOver    = 1,
+    oversRemaining = 20,
+  } = matchState;
+
+  const {
+    widesThisInnings   = 0,
+    noBallsThisInnings = 0,
+    byesThisInnings    = 0,
+    legByesThisInnings = 0,
+    totalExtras        = 0,
+    extrasThisOver     = 0,
+    lastBallWasNoBall  = false,
+    freehitActive      = false,
+    extrasRate         = 0,
+  } = extrasData;
+
+  const isDeathOvers = oversRemaining < 5;
+  const isPowerplay  = currentOver <= 6;
+  let adjustment     = 0;
+
+  // ───────────────────────────────────
+  // Factor 1: Wides Rate
+  // ───────────────────────────────────
+  const widesPerOver = widesThisInnings / Math.max(currentOver, 1);
+  if (widesPerOver > 2)        adjustment += 0.04;
+  else if (widesPerOver > 1)   adjustment += 0.02;
+  else if (widesPerOver > 0.5) adjustment += 0.01;
+
+  // Death overs wide amplification
+  if (isDeathOvers && extrasThisOver >= 2) adjustment += 0.05;
+
+  // ───────────────────────────────────
+  // Factor 2: No Ball Impact + Free Hit
+  // ───────────────────────────────────
+  const noBallsPerOver = noBallsThisInnings / Math.max(currentOver, 1);
+  if (noBallsPerOver > 1)      adjustment += 0.030;
+  else if (noBallsPerOver > 0.5) adjustment += 0.015;
+
+  if (freehitActive) {
+    adjustment += isDeathOvers ? 0.07 : 0.04;
+  }
+  if (lastBallWasNoBall && !freehitActive) adjustment += 0.02;
+
+  // ───────────────────────────────────
+  // Factor 3: Total Extras Rate
+  // ───────────────────────────────────
+  if (extrasRate > 3)       adjustment += 0.05;
+  else if (extrasRate > 2)  adjustment += 0.03;
+  else if (extrasRate > 1.5) adjustment += 0.02;
+  else if (extrasRate > 1)  adjustment += 0.01;
+
+  // ───────────────────────────────────
+  // Factor 4: Current Over Extras
+  // ───────────────────────────────────
+  if (extrasThisOver >= 3)      adjustment += 0.04;
+  else if (extrasThisOver === 2) adjustment += 0.02;
+  else if (extrasThisOver === 1) adjustment += 0.01;
+
+  // ───────────────────────────────────
+  // Factor 5: Powerplay Extras Penalty
+  // ───────────────────────────────────
+  if (isPowerplay && totalExtras > 6)       adjustment += 0.030;
+  else if (isPowerplay && totalExtras > 4)  adjustment += 0.015;
+
+  // ───────────────────────────────────
+  // Factor 6: Extra Balls Available
+  // ───────────────────────────────────
+  const extraBallsGained = noBallsThisInnings + widesThisInnings;
+  if (extraBallsGained > 15)      adjustment += 0.04;
+  else if (extraBallsGained > 10) adjustment += 0.03;
+  else if (extraBallsGained > 5)  adjustment += 0.01;
+
+  // Clamp: max +15% from extras alone, min 0%
+  return Math.min(0.15, Math.max(0, adjustment));
+}
+
+// ═══════════════════════════════════════════════════════════
 // CORE: Calculate win probability for batting team
 // ═══════════════════════════════════════════════════════════
 
@@ -53,7 +179,7 @@ const STAR_BATSMEN = {
  */
 function calculateWinProbability(matchState) {
   if (!matchState || !matchState.teams || matchState.teams.length < 2) {
-    return { battingProb: 0.5, bowlingProb: 0.5 };
+    return { battingProb: 0.5, bowlingProb: 0.5, extrasAdj: 0 };
   }
 
   const team1 = matchState.teams[0];
@@ -65,45 +191,38 @@ function calculateWinProbability(matchState) {
   const totalRating = rating1 + rating2;
   let battingProb = rating1 / totalRating; // team1 assumed batting
 
-  // ── 2. Run rate factor ─────────────────────────────────
+  // ── 2. Run rate factor (sigmoid) ───────────────────────
   const crr = parseFloat(matchState.crr || 0);
   const rrr = parseFloat(matchState.rrr || 0);
+  const oversPlayed    = parseFloat(matchState.overs || 0);
+  const oversRemaining = 20 - oversPlayed;
 
   if (rrr > 0 && matchState.currentInnings === 2) {
-    // 2nd innings: compare CRR to RRR
-    if (crr > rrr) {
-      battingProb += (crr - rrr) * 0.035; // +3.5% per run delta
-    } else {
-      battingProb -= (rrr - crr) * 0.035; // -3.5% per run delta
-    }
+    battingProb += runRateFactor(crr, rrr);
   }
 
-  // ── 3. Wickets factor ──────────────────────────────────
-  const wicketsFallen = parseInt(team1.wickets || 0);
-  battingProb -= wicketsFallen * 0.045; // -4.5% per wicket
-
-  // Check if star batsmen are dismissed (using currentBatsmen to infer)
-  const battingTeamAbbr = team1.abbreviation;
-  const starPlayers = STAR_BATSMEN[battingTeamAbbr] || [];
+  // ── 3. Wickets factor (death-aware) ───────────────────
+  const wicketsFallen    = parseInt(team1.wickets || 0);
+  const battingTeamAbbr  = team1.abbreviation;
+  const starPlayers      = STAR_BATSMEN[battingTeamAbbr] || [];
   const currentBatsmenNames = (matchState.currentBatsmen || []).map((b) => b.name);
 
-  // If none of the star batsmen are currently batting and wickets > 2,
-  // likely star batsmen are dismissed → extra penalty
+  let starsDismissed = 0;
   if (wicketsFallen >= 3 && starPlayers.length > 0) {
     const starsAtCrease = starPlayers.filter((star) =>
       currentBatsmenNames.some((name) =>
         name.toLowerCase().includes(star.split(' ').pop().toLowerCase())
       )
     );
-    const starsDismissed = Math.max(0, Math.min(3, 3 - starsAtCrease.length));
-    battingProb -= starsDismissed * 0.06; // -6% per star batsman dismissed
+    starsDismissed = Math.max(0, Math.min(3, 3 - starsAtCrease.length));
   }
 
-  // ── 4. Overs remaining volatility ─────────────────────
-  const oversPlayed = parseFloat(matchState.overs || 0);
-  const oversRemaining = 20 - oversPlayed;
-  let volatilityMultiplier = 1.0;
+  battingProb += wicketsFactor(wicketsFallen, starsDismissed > 0, oversRemaining);
+  // Extra penalty per star dismissed
+  battingProb -= starsDismissed * 0.06;
 
+  // ── 4. Overs remaining volatility ─────────────────────
+  let volatilityMultiplier = 1.0;
   if (oversRemaining < 5) {
     volatilityMultiplier = 1.8;
   } else if (oversRemaining <= 10) {
@@ -138,6 +257,14 @@ function calculateWinProbability(matchState) {
     }
   }
 
+  // ── 7. Extras factor (NEW) ────────────────────────────
+  const extrasAdj = extrasFactor({
+    ...matchState,
+    currentOver:   oversPlayed,
+    oversRemaining,
+  });
+  battingProb += extrasAdj;
+
   // ── Clamp between 5% and 95% ──────────────────────────
   battingProb = Math.max(0.05, Math.min(0.95, battingProb));
   const bowlingProb = 1 - battingProb;
@@ -145,7 +272,133 @@ function calculateWinProbability(matchState) {
   return {
     battingProb: parseFloat(battingProb.toFixed(4)),
     bowlingProb: parseFloat(bowlingProb.toFixed(4)),
+    extrasAdj:   parseFloat(extrasAdj.toFixed(4)),
   };
+}
+
+
+// ── Alias so getWeightedProbability can call it by name ──
+const getRuleBasedProbability = (matchState) => calculateWinProbability(matchState).battingProb;
+
+// ═══════════════════════════════════════════════════════════
+// ML PROBABILITY ENGINE — calls Render API, silent fallback
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Calls the ML prediction API on Render.
+ * Returns { probability, confidence, source:'ml' } or null if API is down.
+ */
+async function getMLProbability(matchState) {
+  if (!ML_API_URL) return null
+
+  try {
+    const response = await axios.post(
+      `${ML_API_URL}/predict`,
+      {
+        batting_team:
+          matchState.battingTeam ||
+          'Mumbai Indians',
+        bowling_team:
+          matchState.bowlingTeam ||
+          'Chennai Super Kings',
+        city:
+          matchState.city || 'Mumbai',
+        runs_left:
+          matchState.runsLeft || 0,
+        balls_left:
+          matchState.ballsLeft || 60,
+        wickets_remaining:
+          matchState.wicketsRemaining
+          || 10,
+        crr: matchState.CRR || 0,
+        rrr: matchState.RRR || 0,
+        over_number:
+          matchState.currentOver || 10,
+        total_extras:
+          matchState.extrasData
+            ?.totalExtras || 0,
+        extras_rate:
+          matchState.extrasData
+            ?.extrasRate || 0,
+        wides_this_innings:
+          matchState.extrasData
+            ?.widesThisInnings || 0,
+        boundary_percentage: 0.25,
+        dot_ball_percentage: 0.30,
+        partnership_runs: 20,
+        partnership_balls: 18,
+        recent_12_balls_rr:
+          matchState.recent12BallsRR
+          || 0,
+        last_3_overs_avg:
+          matchState.last3OversAvg || 0
+      },
+      {
+        timeout: ML_TIMEOUT,
+        headers: {
+          'Content-Type':
+            'application/json'
+        }
+      }
+    )
+
+    const prob = response.data
+      .batting_team_win_prob
+
+    if (typeof prob === 'number'
+        && prob >= 0.05
+        && prob <= 0.95) {
+      return {
+        probability: prob,
+        confidence:
+          response.data.confidence,
+        source: 'ml'
+      }
+    }
+    return null
+
+  } catch (error) {
+    // Silent fallback — ML being down
+    // should never crash the app
+    return null
+  }
+}
+
+/**
+ * Hybrid probability: 60% ML + 40% rule-based when ML available.
+ * Falls back gracefully to rule-based only.
+ */
+async function getWeightedProbability(
+  matchState
+) {
+  const ruleProbability =
+    getRuleBasedProbability(matchState)
+
+  const mlResult =
+    await getMLProbability(matchState)
+
+  if (mlResult?.probability) {
+    const final =
+      (mlResult.probability * ML_WEIGHT)
+      + (ruleProbability * RULE_WEIGHT)
+
+    console.log(
+      `📊 Odds: ML=${mlResult.probability
+      .toFixed(3)} Rule=${ruleProbability
+      .toFixed(3)} Final=${final.toFixed(3)
+      } [${mlResult.source}]`
+    )
+
+    return {
+      probability: final,
+      source: 'hybrid'
+    }
+  }
+
+  return {
+    probability: ruleProbability,
+    source: 'rule-based'
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -170,19 +423,34 @@ function oddsToImpliedPct(odds) {
 // ═══════════════════════════════════════════════════════════
 
 /**
- * Generate odds for all 26 betting markets given current match state.
+ * Generate odds for all 28+ betting markets given current match state.
  * @param {Object} matchState
  * @param {Object|null} previousOdds — for movement tracking
  * @returns {Array} Array of market odds objects
  */
-function generateAllMarketOdds(matchState, previousOdds = {}) {
+async function generateAllMarketOdds(matchState, previousOdds = {}) {
   if (!matchState) return [];
 
-  const { battingProb, bowlingProb } = calculateWinProbability(matchState);
+  // ── Hybrid probability (ML + rule-based) ──────────────
+  const weighted  = await getWeightedProbability(matchState);
+  const battingProb = weighted.probability;
+  const bowlingProb = 1 - battingProb;
+
+  // Still derive extrasAdj for per-market metadata
+  const { extrasAdj } = calculateWinProbability(matchState);
+
   const markets = [];
   const now = new Date().toISOString();
 
-  // Helper: create market odds object with movement tracking
+  const overs = parseFloat(matchState.overs || 0);
+  const score = parseInt(matchState.teams?.[0]?.score || 0);
+  const wickets = parseInt(matchState.teams?.[0]?.wickets || 0);
+  const isSecondInnings = matchState.currentInnings === 2;
+  const target = matchState.target || 0;
+  const crr = parseFloat(matchState.crr || 0);
+  const freehitNow = matchState.extrasData?.freehitActive || false;
+
+  // Helper: create market odds object with movement tracking + extras fields
   function makeMarket(marketId, marketName, selections) {
     return selections.map((sel) => {
       const prevOdd = previousOdds[`${marketId}_${sel.selection}`];
@@ -202,16 +470,12 @@ function generateAllMarketOdds(matchState, previousOdds = {}) {
         movement,
         locked: sel.locked || false,
         lastUpdated: now,
+        // Extras impact fields (NEW)
+        extrasImpact:  parseFloat((extrasAdj).toFixed(4)),
+        freehitActive: freehitNow,
       };
     });
   }
-
-  const overs = parseFloat(matchState.overs || 0);
-  const score = parseInt(matchState.teams?.[0]?.score || 0);
-  const wickets = parseInt(matchState.teams?.[0]?.wickets || 0);
-  const isSecondInnings = matchState.currentInnings === 2;
-  const target = matchState.target || 0;
-  const crr = parseFloat(matchState.crr || 0);
 
   // ── M01: Match Winner ──────────────────────────────────
   markets.push(...makeMarket('M01', 'Match Winner', [
@@ -465,6 +729,9 @@ function calculateCashOutValue(stake, originalProbability, currentProbability) {
 
 module.exports = {
   calculateWinProbability,
+  getRuleBasedProbability,
+  getMLProbability,
+  getWeightedProbability,
   probabilityToOdds,
   oddsToImpliedPct,
   generateAllMarketOdds,

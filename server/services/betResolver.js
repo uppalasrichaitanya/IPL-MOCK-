@@ -115,4 +115,80 @@ async function settleBets(matchId, marketId, winningSelection) {
   }
 }
 
-module.exports = { settleBets };
+// ═══════════════════════════════════════════════════════════
+// EXTRAS-AWARE HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Calculate total runs scored in an over, including all extras.
+ * Extras ARE part of the over cost and affect over-by-over markets.
+ *
+ * @param {Object} overData — { runs, wides, noBalls, byes, legByes }
+ * @returns {number} total over cost
+ */
+function calculateOverRuns(overData) {
+  const legitimateRuns = overData.runs    || 0;
+  const wides          = overData.wides   || 0;
+  const noBalls        = overData.noBalls || 0;
+  const byes           = overData.byes    || 0;
+  const legByes        = overData.legByes || 0;
+
+  // Total over cost = everything gained by batting team this over
+  return legitimateRuns + wides + noBalls + byes + legByes;
+}
+
+/**
+ * Determine if a delivery is a dot ball.
+ * Wides and no balls are NOT dot balls (they add runs + extra deliveries).
+ *
+ * @param {Object} delivery — { type, runs, isWicket }
+ * @returns {boolean}
+ */
+function isDotBall(delivery) {
+  // Wide = NOT a dot ball (extra delivery + run added)
+  if (delivery.type === 'wide') return false;
+
+  // No ball = NOT a dot ball (free run + free hit next ball)
+  if (delivery.type === 'noball') return false;
+
+  // Legitimate delivery with 0 runs = actual dot ball
+  return delivery.runs === 0;
+}
+
+/**
+ * Determine if a wicket is valid under cricket rules.
+ * On a no ball only run out is valid.
+ * On a wide only run out and stumping are valid.
+ * On a normal delivery any dismissal is valid.
+ *
+ * @param {Object} delivery — { type, wicketType, isWicket, wicket }
+ * @returns {boolean}
+ */
+function isValidWicket(delivery) {
+  // No ball delivery special rules:
+  // ONLY run out is valid on a no ball
+  if (delivery.type === 'noball') {
+    return (
+      delivery.wicketType === 'runout'   ||
+      delivery.wicketType === 'run out'  ||
+      delivery.wicketType === 'Run Out'
+    );
+  }
+
+  // Wide delivery:
+  // Only run out and stumping are valid
+  if (delivery.type === 'wide') {
+    const validOnWide = ['runout', 'run out', 'Run Out', 'stumped', 'Stumped'];
+    return validOnWide.includes(delivery.wicketType);
+  }
+
+  // Normal legitimate delivery: any dismissal type is valid
+  return delivery.isWicket === true || delivery.wicket !== undefined;
+}
+
+module.exports = {
+  settleBets,
+  calculateOverRuns,
+  isDotBall,
+  isValidWicket,
+};

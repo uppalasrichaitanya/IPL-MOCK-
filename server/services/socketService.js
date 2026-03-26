@@ -36,6 +36,9 @@ function startSocketService(io) {
         source: data.source || 'espn',
         timestamp: new Date().toISOString(),
         serviceStatus: getServiceStatus(),
+        // Include extrasData per match — clients need this
+        // to show extras in scoreboard + free hit badge
+        // (extrasData is already inside each match object)
       };
 
       io.emit('score_update', payload);
@@ -58,20 +61,23 @@ function startSocketService(io) {
   }
 
   // ── Odds calculation loop (every 15s) ─────────────────
-  function calculateAndEmitOdds() {
+  async function calculateAndEmitOdds() {
     try {
       if (!latestMatchData || !latestMatchData.matches) {
         return;
       }
 
+      const liveMatches = latestMatchData.matches.filter((m) => m.isLive);
+      if (liveMatches.length === 0) return;
+
+      // Run all ML calls in parallel for each live match
+      const oddsPerMatch = await Promise.all(
+        liveMatches.map((match) => generateAllMarketOdds(match, previousOdds))
+      );
+
       const allOdds = [];
-
-      for (const match of latestMatchData.matches) {
-        if (!match.isLive) continue;
-
-        const marketOdds = generateAllMarketOdds(match, previousOdds);
+      for (const marketOdds of oddsPerMatch) {
         allOdds.push(...marketOdds);
-
         // Store for movement tracking on next cycle
         marketOdds.forEach((m) => {
           previousOdds[`${m.marketId}_${m.selection}`] = m.odds;
@@ -81,9 +87,16 @@ function startSocketService(io) {
       latestOdds = allOdds;
 
       if (allOdds.length > 0) {
+        // Gather freehitActive + extrasImpact across live matches
+        const freehitActive = liveMatches.some((m) => m.extrasData?.freehitActive || false);
+        const extrasImpact  = liveMatches.reduce((sum, m) => sum + (m.extrasData?.extrasRate || 0), 0)
+          / liveMatches.length;
+
         io.emit('odds_update', {
           markets: allOdds,
           timestamp: new Date().toISOString(),
+          freehitActive,
+          extrasImpact: parseFloat(extrasImpact.toFixed(4)),
         });
         console.log(`📊 Odds update sent — ${allOdds.length} market selections across live matches`);
       }
